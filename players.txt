@@ -1,0 +1,11 @@
+# Danh sách người chơi cần theo dõi World Record - mỗi dòng một người.
+# Dòng bắt đầu bằng # là ghi chú, dòng trống sẽ bị bỏ qua. Cách ghi:
+#   nickname              -> khớp theo tên (không phân biệt hoa thường)
+#   nickname | objectID   -> khớp theo objectID, vẫn đúng khi người đó đổi tên
+#   objectID              -> chỉ ghi số objectID
+# Bot tự đọc lại file này khi bạn lưu, không cần khởi động lại.
+
+HoS_LamWang
+귀여운greenii
+HoS_Lamanhh
+

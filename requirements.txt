@@ -1,0 +1,6 @@
+# Bot dependencies for wr_bot
+# Install with: pip install -r requirements.txt
+
+discord.py==2.7.1
+aiohttp==3.14.5
+Pillow>=10.0
