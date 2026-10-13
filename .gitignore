@@ -3,5 +3,6 @@
 __pycache__/
 *.py[cod]
 wr_state.json
+wr_rankings.json
 *.bak
 *.tmp

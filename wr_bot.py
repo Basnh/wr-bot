@@ -13,7 +13,7 @@ Lệnh Discord:
   !track add|remove|list               -> quản lý danh sách theo dõi (add/remove cần quyền Manage Server)
 
 Chạy nền:
-  - Theo dõi mọi bài trong songs.json, báo vào kênh ALERT_CHANNEL_ID khi điểm top 1 tăng
+  - Theo dõi top 1/top 100, báo vào kênh ALERT_CHANNEL_ID khi điểm người chơi tăng
   - Tự đọc lại songs.json khi file thay đổi (AUTO_RELOAD)
   - Nhận lệnh gõ trong terminal (hoặc từ manager.py): reload, quit
 
@@ -77,12 +77,13 @@ SLASH_COMMAND_GUILD_ID = 967430273883045898
 
 PAGE_SIZE = 10          # số người mỗi trang
 CACHE_TTL = 60          # giây, dùng cho lệnh /world_record
-POLL_MINUTES = 5        # chu kỳ theo dõi nền
+POLL_MINUTES = 3        # chu kỳ theo dõi nền
 MAX_CONCURRENCY = 5     # số request song song tối đa
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SONGS_FILE = os.path.join(BASE_DIR, "songs.json")       # {"153": {"artist": ..., "song": ..., "album": ...}}
 STATE_FILE = os.path.join(BASE_DIR, "wr_state.json")    # lưu điểm top 1 lần trước để so sánh
+RANKINGS_FILE = os.path.join(BASE_DIR, "wr_rankings.json")  # snapshot bảng xếp hạng từng bài
 
 PLAYERS_FILE = os.path.join(BASE_DIR, "players.txt")    # mỗi dòng một người chơi cần theo dõi
 TRACK_CACHE_TTL = 600       # giây, dữ liệu cũ nhất được chấp nhận khi dùng /track
@@ -124,6 +125,191 @@ def load_state() -> dict:
 def save_state(state: dict) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+def load_rankings() -> dict:
+    try:
+        with open(RANKINGS_FILE, "r", encoding="utf-8") as f:
+            rankings = json.load(f)
+    except FileNotFoundError:
+        return {"season": SEASON, "updated_at": None, "songs": {}}
+    if not isinstance(rankings, dict) or not isinstance(rankings.get("songs"), dict):
+        raise ValueError(f"{RANKINGS_FILE} không có định dạng snapshot bảng xếp hạng hợp lệ.")
+    if rankings.get("season") != SEASON:
+        return {"season": SEASON, "updated_at": None, "songs": {}}
+    return rankings
+
+
+def save_rankings(rankings: dict) -> None:
+    tmp_path = RANKINGS_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(rankings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, RANKINGS_FILE)
+
+
+def _rank_player_key(player: dict) -> str | None:
+    player_id = player.get("objectID")
+    if player_id is not None and str(player_id):
+        return f"id:{player_id}"
+    nickname = (player.get("nickname") or "").strip().casefold()
+    return f"name:{nickname}" if nickname else None
+
+
+def compare_rankings(previous: list[dict], current: list[dict]) -> dict:
+    """So sánh hạng và điểm giữa hai snapshot, ghép người chơi bằng objectID."""
+    old_by_player = {
+        key: player
+        for player in previous
+        if (key := _rank_player_key(player)) is not None
+    }
+    new_by_player = {
+        key: player
+        for player in current
+        if (key := _rank_player_key(player)) is not None
+    }
+
+    changes = []
+    rank_changes = score_changes = 0
+    for key, player in new_by_player.items():
+        old = old_by_player.get(key)
+        if old is None:
+            changes.append({
+                "type": "entered_top100",
+                "objectID": player.get("objectID"),
+                "nickname": player.get("nickname"),
+                "old_rank": None,
+                "new_rank": player.get("rank"),
+                "old_score": None,
+                "new_score": player.get("highscore"),
+            })
+            continue
+
+        rank_changed = old.get("rank") != player.get("rank")
+        score_changed = old.get("highscore") != player.get("highscore")
+        rank_changes += int(rank_changed)
+        score_changes += int(score_changed)
+        if rank_changed or score_changed:
+            changes.append({
+                "type": "rank_and_score" if rank_changed and score_changed else (
+                    "rank" if rank_changed else "score"
+                ),
+                "objectID": player.get("objectID"),
+                "nickname": player.get("nickname"),
+                "old_rank": old.get("rank"),
+                "new_rank": player.get("rank"),
+                "old_score": old.get("highscore"),
+                "new_score": player.get("highscore"),
+            })
+
+    for key, player in old_by_player.items():
+        if key not in new_by_player:
+            changes.append({
+                "type": "left_top100",
+                "objectID": player.get("objectID"),
+                "nickname": player.get("nickname"),
+                "old_rank": player.get("rank"),
+                "new_rank": None,
+                "old_score": player.get("highscore"),
+                "new_score": None,
+            })
+
+    return {
+        "rank_changes": rank_changes,
+        "score_changes": score_changes,
+        "entered_top100": sum(change["type"] == "entered_top100" for change in changes),
+        "left_top100": sum(change["type"] == "left_top100" for change in changes),
+        "players": changes,
+    }
+
+
+def _score_increase(change: dict) -> int | float | None:
+    old_score, new_score = change.get("old_score"), change.get("new_score")
+    if not isinstance(old_score, (int, float)) or not isinstance(new_score, (int, float)):
+        return None
+    increase = new_score - old_score
+    return increase if increase > 0 else None
+
+
+def _top100_change_embeds(song_id: str, report: dict) -> list[discord.Embed]:
+    improvements = [
+        change for change in report["players"]
+        if _score_increase(change) is not None
+    ]
+    if not improvements:
+        return []
+
+    song = SONGS.get(song_id, {})
+    title = discord.utils.escape_markdown(
+        discord.utils.escape_mentions(display(song_id) if song_id in SONGS else f"Bài {song_id}")
+    )[:250]
+    summary = f"🎯 Điểm tăng của **{len(improvements)}** người chơi trong top 100"
+
+    def score_text(value) -> str:
+        if isinstance(value, (int, float)):
+            return f"{value:,.0f}"
+        return str(value) if value is not None else "—"
+
+    lines = []
+    for change in improvements:
+        nickname = discord.utils.escape_markdown(
+            discord.utils.escape_mentions(change.get("nickname") or "Unknown")
+        )[:50]
+        increase = _score_increase(change) or 0
+        rank = f" · hạng hiện tại **#{change['new_rank']}**" if change.get("new_rank") else ""
+        lines.append(
+            f"• **{nickname}**{rank} · "
+            f"`{score_text(change['old_score'])}` → **`{score_text(change['new_score'])}`** "
+            f"(+{score_text(increase)})"
+        )
+
+    lines_per_embed = 20
+    chunks = [
+        lines[index:index + lines_per_embed]
+        for index in range(0, len(lines), lines_per_embed)
+    ] or [[]]
+    cover_url = song.get("cover", "")
+    embeds = []
+    for page, chunk in enumerate(chunks, 1):
+        description = f"{summary}\n\n" + ("\n".join(chunk) if chunk else "Chưa có thay đổi.")
+        embed = discord.Embed(
+            title=f"📊 Thay đổi World Record · Top 100",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+        embed.set_author(name=title)
+        if cover_url.startswith(("https://", "http://")):
+            embed.set_thumbnail(url=cover_url)
+        footer = f"Season {SEASON}"
+        if len(chunks) > 1:
+            footer += f" · Trang {page}/{len(chunks)}"
+        embed.set_footer(text=footer)
+        embeds.append(embed)
+    return embeds
+
+
+async def _send_alert_embeds(embeds: list[discord.Embed], source: str) -> None:
+    if not embeds:
+        return
+    if not ALERT_CHANNEL_ID:
+        print(f"[{source}] Chưa cấu hình ALERT_CHANNEL_ID; bỏ qua {len(embeds)} embed cảnh báo.", flush=True)
+        return
+
+    channel = bot.get_channel(ALERT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(ALERT_CHANNEL_ID)
+        except discord.HTTPException as error:
+            print(f"[{source}] Không tìm thấy kênh cảnh báo {ALERT_CHANNEL_ID}: {error}", flush=True)
+            return
+    if not isinstance(channel, discord.abc.Messageable):
+        print(f"[{source}] Kênh {ALERT_CHANNEL_ID} không hỗ trợ gửi tin nhắn.", flush=True)
+        return
+
+    for index in range(0, len(embeds), 10):
+        try:
+            await channel.send(embeds=embeds[index:index + 10])
+        except discord.HTTPException as error:
+            print(f"[{source}] Không gửi được cảnh báo vào kênh {ALERT_CHANNEL_ID}: {error}", flush=True)
 
 
 SONGS = load_songs()
@@ -593,7 +779,8 @@ HELP_PAGES = {
             ),
             (
                 "🔒 Quyền quản lý",
-                "Thêm, xóa, đồng bộ bài hát và tải lại dữ liệu chỉ dành cho chủ bot.",
+                "Thêm, xóa, đồng bộ bài hát, tải lại dữ liệu và cập nhật WR toàn bộ chỉ dành cho chủ bot.\n"
+                f"`{PREFIX}refresh_wr` — làm mới bảng xếp hạng tất cả ID và lưu snapshot.",
             ),
         ],
     },
@@ -616,6 +803,7 @@ HELP_PAGES = {
                 "`/songs sync` — đồng bộ từ Google Sheets hoặc CSV đính kèm.\n"
                 "Đồng bộ mặc định thêm bài mới và cập nhật riêng cover; bật `overwrite` để "
                 "cập nhật toàn bộ thông tin bài đã có hoặc `dry_run` để xem trước.\n"
+                "`!refresh_wr` — cập nhật WR toàn bộ ID, lưu snapshot JSON.\n"
                 "`!deploy` — (chỉ chủ bot) lấy commit mới từ GitHub và restart bot trên VPS.",
             ),
             (
@@ -944,6 +1132,17 @@ async def _send_song_lines(target, lines: list[str]) -> None:
 SONG_LIST_PAGE_SIZE = 12
 
 
+def _song_album_sort_key(item: tuple[str, dict]) -> tuple:
+    album = item[1]["album"].strip()
+    artist = item[1]["artist"].strip()
+    return (
+        not bool(album),
+        album.casefold(),
+        artist.casefold(),
+        _song_sort_key(item),
+    )
+
+
 def _song_list_embed(
     entries: list[tuple[str, dict]], artist: str | None, page: int
 ) -> discord.Embed:
@@ -951,25 +1150,45 @@ def _song_list_embed(
     start = page * SONG_LIST_PAGE_SIZE
     current = entries[start:start + SONG_LIST_PAGE_SIZE]
     esc = discord.utils.escape_markdown
-    lines = []
+    safe = lambda value: esc(discord.utils.escape_mentions(value))
+    album_count = len({
+        (song["artist"].casefold(), song["album"].casefold())
+        for _, song in entries
+        if song["album"].strip()
+    })
+    artist_label = safe(artist)[:80] if artist else "Tất cả nghệ sĩ"
+    lines = [
+        f"**{artist_label}**  ·  **{len(entries)}** bài hát  ·  **{album_count}** album",
+        "────────────────────────",
+    ]
+    previous_group: tuple[str, str] | None = None
     for sid, song in current:
-        title = esc(song["song"] or "(chưa rõ tên)")[:100]
-        details = [esc(song["artist"])[:80]] if song["artist"] else []
-        if song["album"]:
-            details.append(esc(song["album"])[:80])
-        suffix = f"\n　└ {' · '.join(details)}" if details else ""
-        lines.append(f"**`{sid}`**　{title}{suffix}")
+        group = (
+            song["artist"].strip().casefold(),
+            song["album"].strip().casefold(),
+        )
+        if group != previous_group:
+            album_title = safe(song["album"].strip() or "Chưa xếp album")[:85]
+            if not artist and song["artist"]:
+                album_title = f"{safe(song['artist'])[:65]}  ·  {album_title}"
+            lines.append(f"\n💿  **{album_title}**")
+            previous_group = group
 
-    description = "\n\n".join(lines) if lines else "Không tìm thấy bài hát nào."
-    if artist:
-        description = f"**Lọc nghệ sĩ:** {esc(artist)[:100]}\n\n{description}"
+        title = safe(song["song"] or "(chưa rõ tên)")[:100]
+        lines.append(f"> `{sid}`  ·  {title}")
+
+    if not entries:
+        lines.append("\n*Không tìm thấy bài hát nào.*")
 
     embed = discord.Embed(
         title="🎵 Danh sách bài hát",
-        description=description,
+        description="\n".join(lines),
         color=discord.Color.blurple(),
     )
-    embed.set_footer(text=f"{len(entries)} bài · Trang {page + 1}/{pages}")
+    embed.set_author(name="SUPERSTAR JYP  •  THƯ VIỆN ÂM NHẠC")
+    embed.set_footer(
+        text=f"{len(entries)} bài hát  ·  {album_count} album  •  Trang {page + 1}/{pages}"
+    )
     return embed
 
 
@@ -1032,7 +1251,7 @@ async def _send_song_list(target, artist: str | None = None) -> None:
             for sid, song in songs.items()
             if not artist or artist.casefold() in song["artist"].casefold()
         ),
-        key=_song_sort_key,
+        key=_song_album_sort_key,
     )
     owner_id = target.user.id if isinstance(target, discord.Interaction) else target.author.id
     view = SongListView(owner_id, entries, artist)
@@ -1402,8 +1621,13 @@ def compute_player_wrs(entries: dict[str, dict], wanted: list[dict]) -> list[dic
                 songs.append({
                     "sid": sid, "score": top, "tied": tied,
                     "rank": hit.get("rank"), "time": hit.get("updatedAt") or 0,
+                    "artist": SONGS.get(sid, {}).get("artist") or "Không rõ nghệ sĩ",
                 })
-        songs.sort(key=lambda s: int(s["sid"]) if s["sid"].isdigit() else 10**9)
+        songs.sort(key=lambda s: (
+            s["artist"].casefold(),
+            SONGS.get(s["sid"], {}).get("song", "").casefold(),
+            int(s["sid"]) if s["sid"].isdigit() else 10**9,
+        ))
         results.append({"entry": w, "name": name, "songs": songs, "seen_in": seen_in})
     results.sort(key=lambda r: (-len(r["songs"]), r["name"].casefold()))
     return results
@@ -1411,18 +1635,22 @@ def compute_player_wrs(entries: dict[str, dict], wanted: list[dict]) -> list[dic
 
 def _song_line(s: dict) -> str:
     esc = discord.utils.escape_markdown
-    title = display(s["sid"]) if s["sid"] in SONGS else f"Bài {s['sid']}"
+    song = SONGS.get(s["sid"])
+    if song:
+        title = song.get("song") or display(s["sid"])
+    else:
+        title = f"Bài {s['sid']}"
     if s.get("rank") is not None:  # hạng hiện tại của người này ở bài đó
         place = f"hạng **#{s['rank']}**"
-        if s["tied"] > 1:
-            place += f" (đồng điểm {s['tied']} người)"
+        # if s["tied"] > 1:
+            # place += f" (đồng điểm {s['tied']} người)" # Phần này comment để bỏ phần đồng hạng
     else:
         place = "một mình" if s["tied"] == 1 else f"đồng hạng với {s['tied'] - 1} người"
     when = f" · {ts_tag(s['time'])}" if s["time"] else ""
     return f"• **{esc(title)}** · `{s['score']:,}`{when} · {place}"
 
 
-def build_track_pages(results: list[dict]) -> list[str]:
+def build_track_pages(results: list[dict], artist_filter: str | None = None) -> list[str]:
     """Chia danh sách thành các trang theo số ký tự/số dòng; người nào bị cắt giữa chừng sẽ có tiêu đề '(tiếp)'."""
     esc = discord.utils.escape_markdown
     pages: list[str] = []
@@ -1453,14 +1681,26 @@ def build_track_pages(results: list[dict]) -> list[str]:
         cur.append(header)
         size += len(header) + 1
 
-    for r in (r for r in results if r["songs"]):
-        header = f"### 👤 {esc(r['name'])} — **{len(r['songs'])} WR**"
-        lines = [_song_line(s) for s in r["songs"]]
-        start_block(header, lines[0])
-        for line in lines:
-            push(line, owner=header)
+    visible = []
+    for result in results:
+        songs = result["songs"]
+        if artist_filter is not None:
+            songs = [s for s in songs if s["artist"].casefold() == artist_filter.casefold()]
+        visible.append({**result, "songs": songs})
 
-    idle = [r for r in results if not r["songs"]]
+    for r in (r for r in visible if r["songs"]):
+        header = f"### 👤 {esc(r['name'])} — **{len(r['songs'])} WR**"
+        grouped: dict[str, list[dict]] = {}
+        for song in r["songs"]:
+            grouped.setdefault(song["artist"], []).append(song)
+        first_artist = next(iter(grouped))
+        start_block(header, f"## 🎤 {esc(first_artist)}")
+        for artist, songs in grouped.items():
+            push(f"## 🎤 {esc(artist)}", owner=header)
+            for song in songs:
+                push(_song_line(song), owner=header)
+
+    idle = [r for r in visible if not r["songs"]] if artist_filter is None else []
     if idle:
         names = [
             esc(r["name"]) + (f" ({r['seen_in']} bài trong top 100)" if r["seen_in"] else " (chưa vào top 100)")
@@ -1478,35 +1718,141 @@ def build_track_pages(results: list[dict]) -> list[str]:
         for c in chunks:
             push(c)
     flush()
-    return pages or ["Chưa có dữ liệu."]
+    if pages:
+        return pages
+    if artist_filter is not None:
+        return [f"Không có WR thuộc nghệ sĩ **{esc(artist_filter)}**."]
+    return ["Chưa có dữ liệu."]
 
 
-def build_track_embed(results: list[dict], pages: list[str], updated: datetime, page: int) -> discord.Embed:
+def build_track_embed(
+    results: list[dict],
+    pages: list[str],
+    updated: datetime,
+    page: int,
+    artist_filter: str | None = None,
+) -> discord.Embed:
     total_wr = sum(len(r["songs"]) for r in results)
     distinct = len({s["sid"] for r in results for s in r["songs"]})
     summary = f"👥 **{len(results)}** người · 🏆 **{total_wr} WR** · 🎵 **{distinct}** bài khác nhau"
+    if artist_filter is not None:
+        summary += f"`\n🎤 Nghệ sĩ: **{discord.utils.escape_markdown(artist_filter)}**`"
     embed = discord.Embed(
-        title=f"{GAME_TITLE} - Người chơi theo dõi (Season {SEASON})",
+        title=f"{GAME_TITLE} - Player Tracker (Mùa {SEASON})",
         description=f"{summary}\n\n{pages[page]}",
         color=discord.Color.gold(),
     )
-    embed.set_footer(text=f"Page {page + 1}/{len(pages)} · Dữ liệu cập nhật")
+    embed.set_footer(text=f"Trang {page + 1}/{len(pages)} · Dữ liệu cập nhật")
     embed.timestamp = updated
     return embed
 
 
-class PagedView(discord.ui.View):
-    """Nút Previous/Next dùng chung: render(page) -> Embed."""
+TRACK_ALL_ARTISTS = "__all_artists__"
+TRACK_ARTISTS_PER_PAGE = 24
 
-    def __init__(self, owner_id: int, pages: int, render) -> None:
+
+class TrackArtistSelect(discord.ui.Select):
+    def __init__(self, view: "TrackResultsView") -> None:
+        self.track_view = view
+        options = [
+            discord.SelectOption(
+                label="Tất cả nghệ sĩ",
+                value=TRACK_ALL_ARTISTS,
+                emoji="🎤",
+                default=view.artist_filter is None,
+            )
+        ]
+        start = view.artist_page * TRACK_ARTISTS_PER_PAGE
+        for index, artist in enumerate(
+            view.artists[start:start + TRACK_ARTISTS_PER_PAGE], start=start
+        ):
+            options.append(discord.SelectOption(
+                label=artist[:100],
+                value=f"artist:{index}",
+                default=(
+                    view.artist_filter is not None
+                    and artist.casefold() == view.artist_filter.casefold()
+                ),
+            ))
+        super().__init__(
+            placeholder="Lọc kết quả theo nghệ sĩ...",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        selected = self.values[0]
+        if selected == TRACK_ALL_ARTISTS:
+            self.track_view.artist_filter = None
+        else:
+            artist_index = int(selected.split(":", 1)[1])
+            self.track_view.artist_filter = self.track_view.artists[artist_index]
+        self.track_view.page = 0
+        self.track_view._update_artist_select()
+        await self.track_view._show(interaction)
+
+
+class TrackResultsView(discord.ui.View):
+    """Phân trang kết quả WR và lọc chúng theo nghệ sĩ."""
+
+    def __init__(self, owner_id: int, results: list[dict], updated: datetime) -> None:
         super().__init__(timeout=300)
-        self.owner_id, self.pages, self.render, self.page = owner_id, pages, render, 0
+        self.owner_id = owner_id
+        self.results = results
+        self.updated = updated
+        self.artists = sorted(
+            {song["artist"] for result in results for song in result["songs"]},
+            key=str.casefold,
+        )
+        self.artist_filter: str | None = None
+        self.artist_page = 0
+        self.page = 0
         self.message: discord.Message | None = None
+        self.artist_select = TrackArtistSelect(self)
+        self.add_item(self.artist_select)
         self._sync()
 
     def _sync(self) -> None:
+        pages = self._pages()
         self.prev_btn.disabled = self.page <= 0
-        self.next_btn.disabled = self.page >= self.pages - 1
+        self.next_btn.disabled = self.page >= len(pages) - 1
+        artist_pages = max(1, math.ceil(len(self.artists) / TRACK_ARTISTS_PER_PAGE))
+        self.prev_artist_btn.disabled = self.artist_page <= 0
+        self.next_artist_btn.disabled = self.artist_page >= artist_pages - 1
+        self.prev_artist_btn.label = f"Nghệ sĩ trước ({self.artist_page + 1}/{artist_pages})"
+        self.next_artist_btn.label = f"Nghệ sĩ sau ({self.artist_page + 1}/{artist_pages})"
+
+    def _filtered_results(self) -> list[dict]:
+        if self.artist_filter is None:
+            return self.results
+        return [
+            {**result, "songs": [
+                song for song in result["songs"]
+                if song["artist"].casefold() == self.artist_filter.casefold()
+            ]}
+            for result in self.results
+            if any(
+                song["artist"].casefold() == self.artist_filter.casefold()
+                for song in result["songs"]
+            )
+        ]
+
+    def _pages(self) -> list[str]:
+        return build_track_pages(self._filtered_results(), self.artist_filter)
+
+    def _embed(self) -> discord.Embed:
+        pages = self._pages()
+        self.page = min(self.page, len(pages) - 1)
+        return build_track_embed(
+            self._filtered_results(), pages, self.updated, self.page, self.artist_filter
+        )
+
+    def _update_artist_select(self) -> None:
+        self.remove_item(self.artist_select)
+        self.artist_select = TrackArtistSelect(self)
+        self.add_item(self.artist_select)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner_id:
@@ -1516,16 +1862,28 @@ class PagedView(discord.ui.View):
 
     async def _show(self, interaction: discord.Interaction) -> None:
         self._sync()
-        await interaction.response.edit_message(embed=self.render(self.page), view=self)
+        await interaction.response.edit_message(embed=self._embed(), view=self)
 
-    @discord.ui.button(label="Trang trước", style=discord.ButtonStyle.primary)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Trang trước", style=discord.ButtonStyle.primary, row=1)
+    async def prev_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
         self.page -= 1
         await self._show(interaction)
 
-    @discord.ui.button(label="Trang sau", style=discord.ButtonStyle.success)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Trang sau", style=discord.ButtonStyle.success, row=1)
+    async def next_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
         self.page += 1
+        await self._show(interaction)
+
+    @discord.ui.button(label="Nghệ sĩ trước", style=discord.ButtonStyle.secondary, row=2)
+    async def prev_artist_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.artist_page -= 1
+        self._update_artist_select()
+        await self._show(interaction)
+
+    @discord.ui.button(label="Nghệ sĩ sau", style=discord.ButtonStyle.secondary, row=2)
+    async def next_artist_btn(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        self.artist_page += 1
+        self._update_artist_select()
         await self._show(interaction)
 
     async def on_timeout(self) -> None:
@@ -1571,10 +1929,9 @@ async def build_track_response(
         if not results:
             return f"Không có ai khớp `{query}` trong danh sách theo dõi.", None, None
 
-    pages = build_track_pages(results)
     updated = max(e["updated"] for e in entries.values())
-    view = PagedView(user_id, len(pages), lambda p: build_track_embed(results, pages, updated, p))
-    return None, build_track_embed(results, pages, updated, 0), view
+    view = TrackResultsView(user_id, results, updated)
+    return None, view._embed(), view
 
 
 # ---------- Quản lý danh sách (ghi vào players.txt, giữ nguyên ghi chú) ----------
@@ -1841,6 +2198,199 @@ async def reload_cmd(ctx: commands.Context):
     await ctx.send(("✅ " if ok else "⚠️ ") + msg)
 
 
+RANKINGS_REFRESH_LOCK = asyncio.Lock()
+
+
+@bot.command(name="refresh_wr", aliases=["update_wr", "wr_update"])
+@commands.is_owner()
+async def refresh_wr_cmd(ctx: commands.Context):
+    """Làm mới bảng xếp hạng cho tất cả ID, lưu snapshot top 100 vào wr_rankings.json."""
+    if RANKINGS_REFRESH_LOCK.locked():
+        await ctx.send("Một lần cập nhật toàn bộ WR đang chạy rồi.")
+        return
+
+    async with RANKINGS_REFRESH_LOCK:
+        song_ids = list(SONGS)
+        if not song_ids:
+            await ctx.send("Không có ID bài hát nào trong songs.json.")
+            return
+
+        try:
+            rankings = await asyncio.to_thread(load_rankings)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            await ctx.send(f"Không đọc được snapshot WR hiện tại: {error}")
+            return
+
+        status_message = await ctx.send(
+            f"Đang cập nhật bảng xếp hạng cho {len(song_ids)} bài..."
+        )
+        same_season = rankings.get("season") == SEASON
+        refreshed = 0
+        failed: list[tuple[str, str]] = []
+        compared = rank_changes = score_changes = entered_top100 = left_top100 = 0
+        score_improvements = 0
+        change_samples: list[str] = []
+        top100_alerts: list[discord.Embed] = []
+        batch_size = 25
+
+        async def update_progress(completed: int) -> None:
+            try:
+                await status_message.edit(
+                    content=(
+                        f"Đang cập nhật WR: {completed}/{len(song_ids)} bài "
+                        f"(thành công {refreshed}, lỗi {len(failed)})..."
+                    )
+                )
+            except discord.HTTPException as error:
+                print(f"[refresh_wr] Không cập nhật được tin nhắn tiến độ: {error}", flush=True)
+
+        for start in range(0, len(song_ids), batch_size):
+            batch = song_ids[start : start + batch_size]
+            cached_fetch_times = {
+                song_id: (wr.cache.get(song_id) or {}).get("fetched")
+                for song_id in batch
+            }
+            results = await asyncio.gather(
+                *(wr.get(song_id, force=True) for song_id in batch),
+                return_exceptions=True,
+            )
+
+            for song_id, result in zip(batch, results):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, Exception):
+                    failed.append((song_id, type(result).__name__))
+                    print(f"[refresh_wr] ID {song_id}: {result}", flush=True)
+                    continue
+                if not result or not isinstance(result.get("data"), list) or not result["data"]:
+                    failed.append((song_id, "Không có dữ liệu WR"))
+                    continue
+                if result.get("fetched", 0) <= (cached_fetch_times[song_id] or 0):
+                    failed.append((song_id, "API lỗi; nhận lại dữ liệu cache cũ"))
+                    continue
+
+                updated = result.get("updated")
+                previous = (
+                    rankings["songs"].get(song_id, {}).get("data", [])
+                    if same_season
+                    else []
+                )
+                change_report = (
+                    compare_rankings(previous, result["data"])
+                    if previous
+                    else {
+                        "rank_changes": 0,
+                        "score_changes": 0,
+                        "entered_top100": 0,
+                        "left_top100": 0,
+                        "players": [],
+                    }
+                )
+                if previous:
+                    compared += 1
+                    rank_changes += change_report["rank_changes"]
+                    score_changes += change_report["score_changes"]
+                    entered_top100 += change_report["entered_top100"]
+                    left_top100 += change_report["left_top100"]
+                    if change_report["players"]:
+                        top100_alerts.extend(_top100_change_embeds(song_id, change_report))
+                    song_name = discord.utils.escape_mentions(display(song_id))[:45]
+                    for change in change_report["players"]:
+                        increase = _score_increase(change)
+                        if increase is None:
+                            continue
+                        score_improvements += 1
+                        nickname = discord.utils.escape_markdown(
+                            discord.utils.escape_mentions(change.get("nickname") or "Unknown")
+                        )[:24]
+                        rank = (
+                            f" · hạng hiện tại #{change['new_rank']}"
+                            if change.get("new_rank") is not None
+                            else ""
+                        )
+                        change_samples.append(
+                            f"`{song_id}` {song_name}: **{nickname}** tăng điểm "
+                            f"{change['old_score']:,} → {change['new_score']:,} "
+                            f"(+{increase:,.0f}){rank}"
+                        )
+
+                rankings["songs"][song_id] = {
+                    "updated": updated.isoformat() if updated else None,
+                    "fetched_at": datetime.fromtimestamp(
+                        result["fetched"], timezone.utc
+                    ).isoformat(),
+                    "entries": len(result["data"]),
+                    "data": result["data"],
+                    "changes": change_report,
+                }
+                refreshed += 1
+
+            completed = min(start + len(batch), len(song_ids))
+            if completed < len(song_ids):
+                await update_progress(completed)
+
+        if refreshed:
+            rankings["season"] = SEASON
+            rankings["updated_at"] = datetime.now(timezone.utc).isoformat()
+            rankings["change_summary"] = {
+                "compared_songs": compared,
+                "rank_changes": rank_changes,
+                "score_changes": score_changes,
+                "entered_top100": entered_top100,
+                "left_top100": left_top100,
+            }
+            try:
+                await asyncio.to_thread(save_rankings, rankings)
+            except (OSError, TypeError, ValueError) as error:
+                await status_message.edit(
+                    content=f"Đã tải mới {refreshed} bài nhưng không lưu được {RANKINGS_FILE}: {error}"
+                )
+                return
+
+        summary = (
+            f"✅ Đã cập nhật {refreshed}/{len(song_ids)} bài. "
+            f"Snapshot và thay đổi được lưu tại `{os.path.basename(RANKINGS_FILE)}`."
+            if refreshed
+            else f"⚠️ Không cập nhật được dữ liệu mới cho bài nào trong {len(song_ids)} ID."
+        )
+        if compared:
+            summary += (
+                f"\nĐã so sánh {compared} bài: điểm tăng trong top 100 "
+                f"ở **{score_improvements}** lượt."
+            )
+            baseline_created = refreshed - compared
+            if baseline_created:
+                summary += f" Tạo baseline mới cho {baseline_created} bài."
+            if change_samples:
+                summary += "\n**Một số thay đổi:**"
+                shown = 0
+                for line in change_samples:
+                    sample = f"\n• {line}"
+                    if len(summary) + len(sample) > 1500:
+                        break
+                    summary += sample
+                    shown += 1
+                remaining = len(change_samples) - shown
+                if remaining > 0:
+                    summary += f"\n... và {remaining} thay đổi khác."
+        elif refreshed:
+            summary += (
+                f"\nChưa có snapshot cũ để so sánh; đã tạo baseline cho {refreshed} bài."
+            )
+        if failed:
+            failed_ids = ", ".join(song_id for song_id, _ in failed[:20])
+            more = f" và {len(failed) - 20} ID khác" if len(failed) > 20 else ""
+            summary += (
+                f"\nKhông cập nhật {len(failed)} bài: `{failed_ids}{more}`. "
+                "Snapshot cũ của các ID lỗi được giữ nguyên."
+            )
+        try:
+            await status_message.edit(content=summary)
+        except discord.HTTPException as error:
+            print(f"[refresh_wr] Không gửi được kết quả cuối: {error}", flush=True)
+        await _send_alert_embeds(top100_alerts, "refresh_wr")
+
+
 async def _run_deploy_process(
     args: list[str],
     cwd: str | None = None,
@@ -2075,15 +2625,33 @@ async def on_ready():
 # ----------------------------- Theo dõi WR mới -----------------------------
 @tasks.loop(minutes=POLL_MINUTES)
 async def watch():
+    async with RANKINGS_REFRESH_LOCK:
+        await _watch_cycle()
+
+
+async def _watch_cycle() -> None:
     state = load_state()
     first_run = not state
-    alerts: list[discord.Embed] = []
+    top1_alerts: list[discord.Embed] = []
+    top100_alerts: list[discord.Embed] = []
+    cached_fetch_times = {
+        song_id: (wr.cache.get(song_id) or {}).get("fetched")
+        for song_id in SONGS
+    }
+    fresh_entries: dict[str, dict] = {}
+
+    try:
+        rankings = await asyncio.to_thread(load_rankings)
+    except (OSError, json.JSONDecodeError, ValueError) as error:
+        rankings = None
+        print(f"[watch] Không đọc được snapshot Top 100; bỏ qua so sánh lần này: {error}", flush=True)
 
     async def check(song_id: str):
         entry = await wr.get(song_id, force=True)
         if not entry or not entry["data"]:
             return
         data = entry["data"]
+        fresh_entries[song_id] = entry
         top_score = data[0]["highscore"]
         holders = [p["nickname"] for p in data if p["highscore"] == top_score]
         top_rank = data[0].get("rank")
@@ -2121,16 +2689,58 @@ async def watch():
             )
             embed.set_footer(text=f"Season {SEASON}")
             embed.timestamp = entry["updated"]
-            alerts.append(embed)
+            top1_alerts.append(embed)
 
     await asyncio.gather(*(check(sid) for sid in SONGS))
     save_state(state)
 
-    if alerts and ALERT_CHANNEL_ID:
-        channel = bot.get_channel(ALERT_CHANNEL_ID)
-        if channel:
-            for i in range(0, len(alerts), 10):  # tối đa 10 embed/tin nhắn
-                await channel.send(embeds=alerts[i : i + 10])
+    rankings_changed = False
+    if rankings is not None:
+        for song_id, entry in fresh_entries.items():
+            if entry.get("fetched", 0) <= (cached_fetch_times[song_id] or 0):
+                continue
+            data = entry.get("data")
+            if not isinstance(data, list) or not data:
+                continue
+
+            previous = rankings["songs"].get(song_id, {}).get("data", [])
+            if previous:
+                change_report = compare_rankings(previous, data)
+                if not change_report["players"]:
+                    continue
+                top100_alerts.extend(_top100_change_embeds(song_id, change_report))
+            else:
+                change_report = {
+                    "rank_changes": 0,
+                    "score_changes": 0,
+                    "entered_top100": 0,
+                    "left_top100": 0,
+                    "players": [],
+                }
+
+            updated = entry.get("updated")
+            rankings["songs"][song_id] = {
+                "updated": updated.isoformat() if updated else None,
+                "fetched_at": datetime.fromtimestamp(
+                    entry["fetched"], timezone.utc
+                ).isoformat(),
+                "entries": len(data),
+                "data": data,
+                "changes": change_report,
+            }
+            rankings_changed = True
+
+    if rankings is not None and rankings_changed:
+        rankings["season"] = SEASON
+        rankings["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            await asyncio.to_thread(save_rankings, rankings)
+        except (OSError, TypeError, ValueError) as error:
+            top100_alerts.clear()
+            print(f"[watch] Không lưu được snapshot Top 100; không gửi cảnh báo thay đổi: {error}", flush=True)
+
+    await _send_alert_embeds(top1_alerts, "watch-top1")
+    await _send_alert_embeds(top100_alerts, "watch-top100")
 
 
 @watch.before_loop

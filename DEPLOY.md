@@ -5,6 +5,10 @@ the configured GitHub branch, fast-forwards the checkout, installs
 `requirements.txt` in the bot's active Python environment, and restarts the systemd
 service. It refuses to deploy when the VPS checkout has uncommitted changes.
 
+The owner can also run `!refresh_wr` to fetch every song ID's current leaderboard,
+compare it with the previous snapshot, and save the latest rows and rank/score
+changes to `wr_rankings.json`. The snapshot is runtime data and is excluded from Git.
+
 ## One-time setup
 
 1. Create a private GitHub repository and push this bot project to the configured
