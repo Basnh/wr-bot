@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+wr_state.json
+*.bak
+*.tmp

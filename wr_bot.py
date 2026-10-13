@@ -66,11 +66,6 @@ load_env()
 # ----------------------------- Cấu hình -----------------------------
 TOKEN = os.environ["DISCORD_TOKEN"]
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
-DEPLOY_SSH_HOST = os.getenv("DEPLOY_SSH_HOST", "").strip()
-DEPLOY_SSH_USER = os.getenv("DEPLOY_SSH_USER", "").strip()
-DEPLOY_SSH_PORT = os.getenv("DEPLOY_SSH_PORT", "22").strip()
-DEPLOY_SSH_KEY = os.getenv("DEPLOY_SSH_KEY", "").strip()
-DEPLOY_REMOTE_PATH = os.getenv("DEPLOY_REMOTE_PATH", "").strip()
 DEPLOY_GIT_BRANCH = os.getenv("DEPLOY_GIT_BRANCH", "main").strip()
 DEPLOY_SYSTEMD_SERVICE = os.getenv("DEPLOY_SYSTEMD_SERVICE", "").strip()
 
@@ -621,7 +616,7 @@ HELP_PAGES = {
                 "`/songs sync` — đồng bộ từ Google Sheets hoặc CSV đính kèm.\n"
                 "Đồng bộ mặc định thêm bài mới và cập nhật riêng cover; bật `overwrite` để "
                 "cập nhật toàn bộ thông tin bài đã có hoặc `dry_run` để xem trước.\n"
-                "`!deploy` — (chỉ chủ bot) push commit lên GitHub rồi cập nhật và restart bot trên VPS.",
+                "`!deploy` — (chỉ chủ bot) lấy commit mới từ GitHub và restart bot trên VPS.",
             ),
             (
                 "Ví dụ prefix",
@@ -1851,177 +1846,176 @@ async def _run_deploy_process(
     cwd: str | None = None,
     timeout: float = 120,
 ) -> tuple[int, str]:
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except FileNotFoundError as error:
+        return 127, f"Không tìm thấy chương trình: {error.filename}"
     try:
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         process.kill()
         await process.communicate()
         raise
-    return process.returncode or 0, output.decode("utf-8", errors="replace").strip()
+    return (
+        process.returncode if process.returncode is not None else 0,
+        output.decode("utf-8", errors="replace").strip(),
+    )
 
 
 @bot.command(name="deploy")
 @commands.is_owner()
 async def deploy_cmd(ctx: commands.Context):
-    required = {
-        "DEPLOY_SSH_HOST": DEPLOY_SSH_HOST,
-        "DEPLOY_SSH_USER": DEPLOY_SSH_USER,
-        "DEPLOY_REMOTE_PATH": DEPLOY_REMOTE_PATH,
-        "DEPLOY_SYSTEMD_SERVICE": DEPLOY_SYSTEMD_SERVICE,
-    }
-    missing = [name for name, value in required.items() if not value]
+    missing = [
+        name
+        for name, value in (
+            ("DEPLOY_SYSTEMD_SERVICE", DEPLOY_SYSTEMD_SERVICE),
+            ("DEPLOY_GIT_BRANCH", DEPLOY_GIT_BRANCH),
+        )
+        if not value
+    ]
     if missing:
         await ctx.send(
-            "Chưa cấu hình deploy: "
+            "Chưa cấu hình deploy trên VPS: "
             + ", ".join(f"`{name}`" for name in missing)
             + ". Hãy điền các giá trị trong `.env` theo `.env.example`."
         )
         return
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", DEPLOY_SSH_HOST):
-        await ctx.send("DEPLOY_SSH_HOST chỉ được chứa hostname hoặc địa chỉ IPv4 hợp lệ.")
-        return
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", DEPLOY_SSH_USER):
-        await ctx.send("DEPLOY_SSH_USER không hợp lệ.")
-        return
-    if not DEPLOY_REMOTE_PATH.startswith("/") or "\n" in DEPLOY_REMOTE_PATH:
-        await ctx.send("DEPLOY_REMOTE_PATH phải là đường dẫn tuyệt đối trên Linux.")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", DEPLOY_GIT_BRANCH):
+        await ctx.send("DEPLOY_GIT_BRANCH không hợp lệ.")
         return
     if not re.fullmatch(r"[A-Za-z0-9_.@-]+\.service", DEPLOY_SYSTEMD_SERVICE):
-        await ctx.send("DEPLOY_SYSTEMD_SERVICE phải là tên service systemd, ví dụ `wr-bot.service`.")
-        return
-    try:
-        ssh_port = int(DEPLOY_SSH_PORT)
-    except ValueError:
-        await ctx.send("DEPLOY_SSH_PORT phải là số từ 1 đến 65535.")
-        return
-    if not 1 <= ssh_port <= 65535:
-        await ctx.send("DEPLOY_SSH_PORT phải là số từ 1 đến 65535.")
+        await ctx.send("DEPLOY_SYSTEMD_SERVICE phải là tên systemd service, ví dụ `wr-bot.service`.")
         return
 
-    async with ctx.typing():
-        git_root_code, git_root = await _run_deploy_process(
-            ["git", "rev-parse", "--show-toplevel"], cwd=BASE_DIR
-        )
-        if git_root_code != 0 or not git_root:
-            await ctx.send("Không tìm thấy Git repository cho bot. Hãy tạo private repo và clone/khởi tạo tại thư mục bot.")
-            return
-        git_root = git_root.splitlines()[-1]
+    git_root_code, git_root = await _run_deploy_process(
+        ["git", "rev-parse", "--show-toplevel"], cwd=BASE_DIR
+    )
+    if git_root_code != 0 or not git_root:
+        await ctx.send("Không tìm thấy Git repository của bot trên VPS.")
+        return
+    git_root = git_root.splitlines()[-1]
 
-        branch_code, branch = await _run_deploy_process(
-            ["git", "-C", git_root, "branch", "--show-current"]
-        )
-        if branch_code != 0 or not branch:
-            await ctx.send("Không xác định được branch Git hiện tại; hãy checkout branch deploy trước.")
-            return
-        if DEPLOY_GIT_BRANCH and branch != DEPLOY_GIT_BRANCH:
-            await ctx.send(
-                f"Branch hiện tại là `{branch}`, nhưng `DEPLOY_GIT_BRANCH` là "
-                f"`{DEPLOY_GIT_BRANCH}`. Hãy chuyển branch hoặc cập nhật cấu hình."
-            )
-            return
-        branch = DEPLOY_GIT_BRANCH or branch
-        ref_code, ref_output = await _run_deploy_process(
-            ["git", "-C", git_root, "check-ref-format", "--branch", branch]
-        )
-        if ref_code != 0:
-            await ctx.send(f"Branch deploy không hợp lệ: {ref_output or branch}")
-            return
-
-        relative_env = os.path.relpath(os.path.join(BASE_DIR, ".env"), git_root)
-        tracked_env_code, _ = await _run_deploy_process(
-            ["git", "-C", git_root, "ls-files", "--error-unmatch", "--", relative_env]
-        )
-        if tracked_env_code == 0:
-            await ctx.send(
-                f"Deploy đã dừng: `{relative_env}` đang được Git theo dõi. "
-                "Hãy bỏ file bí mật khỏi Git trước khi bật deploy."
-            )
-            return
-
-        status_code, status = await _run_deploy_process(
-            ["git", "-C", git_root, "status", "--porcelain"]
-        )
-        if status_code != 0:
-            await ctx.send(f"Không kiểm tra được trạng thái Git: {status}")
-            return
-        if status:
-            await ctx.send(
-                "Deploy chỉ chạy với working tree sạch. Hãy commit thay đổi trên laptop rồi thử lại."
-            )
-            return
-
-        remote_code, _ = await _run_deploy_process(
-            ["git", "-C", git_root, "remote", "get-url", "origin"]
-        )
-        if remote_code != 0:
-            await ctx.send("Git repository chưa có remote `origin`; hãy cấu hình GitHub private trước.")
-            return
-
-        ssh_command = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-p", str(ssh_port)]
-        if DEPLOY_SSH_KEY:
-            key_path = os.path.expanduser(DEPLOY_SSH_KEY)
-            if not os.path.isfile(key_path):
-                await ctx.send("Không tìm thấy file SSH key theo `DEPLOY_SSH_KEY`.")
-                return
-            ssh_command.extend(["-i", key_path, "-o", "IdentitiesOnly=yes"])
-        ssh_target = f"{DEPLOY_SSH_USER}@{DEPLOY_SSH_HOST}"
-
-        try:
-            ssh_code, ssh_output = await _run_deploy_process(
-                [*ssh_command, ssh_target, "true"], timeout=20
-            )
-            if ssh_code != 0:
-                await ctx.send(
-                    f"Không kết nối được VPS qua SSH:\n```text\n{ssh_output[-1200:] or 'SSH connection failed'}\n```"
-                )
-                return
-
-            push_code, push_output = await _run_deploy_process(
-                ["git", "-C", git_root, "push", "origin", branch], timeout=120
-            )
-            if push_code != 0:
-                await ctx.send(
-                    f"Push lên GitHub thất bại:\n```text\n{push_output[-1200:] or 'git push failed'}\n```"
-                )
-                return
-
-            remote_script = " && ".join(
-                (
-                    f"cd -- {shlex.quote(DEPLOY_REMOTE_PATH)}",
-                    f"git fetch origin {shlex.quote(branch)}",
-                    f"git checkout {shlex.quote(branch)}",
-                    f"git pull --ff-only origin {shlex.quote(branch)}",
-                    f"sudo -n systemctl restart {shlex.quote(DEPLOY_SYSTEMD_SERVICE)}",
-                    "sleep 2",
-                    f"sudo -n systemctl is-active --quiet {shlex.quote(DEPLOY_SYSTEMD_SERVICE)}",
-                )
-            )
-            deploy_code, deploy_output = await _run_deploy_process(
-                [*ssh_command, ssh_target, remote_script], timeout=180
-            )
-        except FileNotFoundError as error:
-            await ctx.send(f"Không tìm thấy chương trình cần thiết để deploy: {error.filename}")
-            return
-        except asyncio.TimeoutError:
-            await ctx.send("Deploy quá thời gian chờ; kiểm tra trạng thái VPS trước khi chạy lại.")
-            return
-        except OSError as error:
-            await ctx.send(f"Không thể chạy deploy: {error}")
-            return
-
-    if deploy_code != 0:
+    relative_env = os.path.relpath(os.path.join(BASE_DIR, ".env"), git_root)
+    tracked_env_code, _ = await _run_deploy_process(
+        ["git", "-C", git_root, "ls-files", "--error-unmatch", "--", relative_env]
+    )
+    if tracked_env_code == 0:
         await ctx.send(
-            f"Đã push code lên GitHub nhưng cập nhật VPS thất bại. "
-            f"Kiểm tra Git/SSH/systemd trên VPS:\n```text\n{deploy_output[-1200:] or 'remote deploy failed'}\n```"
+            f"Deploy đã dừng: `{relative_env}` đang được Git theo dõi. "
+            "Hãy gỡ file bí mật khỏi repository trước."
         )
         return
-    await ctx.send(f"Deploy thành công: đã cập nhật `{branch}` và restart `{DEPLOY_SYSTEMD_SERVICE}`.")
+
+    branch_code, branch = await _run_deploy_process(
+        ["git", "-C", git_root, "branch", "--show-current"]
+    )
+    if branch_code != 0 or branch != DEPLOY_GIT_BRANCH:
+        await ctx.send(
+            f"Branch đang checkout trên VPS không khớp với `{DEPLOY_GIT_BRANCH}`."
+        )
+        return
+
+    status_code, status = await _run_deploy_process(
+        ["git", "-C", git_root, "status", "--porcelain"]
+    )
+    if status_code != 0:
+        await ctx.send(f"Không kiểm tra được trạng thái Git: {status}")
+        return
+    if status:
+        await ctx.send(
+            "Deploy đã dừng vì có thay đổi cục bộ chưa commit trên VPS. "
+            "Hãy kiểm tra các thay đổi đó trước; bot không tự ghi đè chúng."
+        )
+        return
+
+    remote_code, _ = await _run_deploy_process(
+        ["git", "-C", git_root, "remote", "get-url", "origin"]
+    )
+    if remote_code != 0:
+        await ctx.send("Git repository trên VPS chưa có remote `origin`.")
+        return
+
+    try:
+        fetch_code, fetch_output = await _run_deploy_process(
+            ["git", "-C", git_root, "fetch", "origin", DEPLOY_GIT_BRANCH],
+            timeout=120,
+        )
+    except FileNotFoundError as error:
+        await ctx.send(f"Không tìm thấy Git trên VPS: {error.filename}")
+        return
+    except asyncio.TimeoutError:
+        await ctx.send("Git fetch quá thời gian chờ; chưa restart bot.")
+        return
+    except OSError as error:
+        await ctx.send(f"Không thể chạy Git fetch: {error}")
+        return
+    if fetch_code != 0:
+        await ctx.send(f"Không tải được code từ GitHub:\n```text\n{fetch_output[-1200:]}\n```")
+        return
+
+    pull_code, pull_output = await _run_deploy_process(
+        ["git", "-C", git_root, "merge", "--ff-only", "FETCH_HEAD"],
+        timeout=120,
+    )
+    if pull_code != 0:
+        await ctx.send(
+            f"Không thể fast-forward code trên VPS; bot chưa restart:\n"
+            f"```text\n{pull_output[-1200:] or 'git merge --ff-only failed'}\n```"
+        )
+        return
+
+    dependency_code, dependency_output = await _run_deploy_process(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-r",
+            os.path.join(git_root, "requirements.txt"),
+        ],
+        cwd=git_root,
+        timeout=300,
+    )
+    if dependency_code != 0:
+        await ctx.send(
+            "Code đã được cập nhật nhưng cài dependencies thất bại; bot chưa restart:\n"
+            f"```text\n{dependency_output[-1200:] or 'pip install failed'}\n```"
+        )
+        return
+
+    revision_code, revision = await _run_deploy_process(
+        ["git", "-C", git_root, "rev-parse", "--short", "HEAD"]
+    )
+    if revision_code != 0:
+        revision = "không xác định"
+    await ctx.send(
+        f"Đã cập nhật code tới `{revision}`. Đang restart `{DEPLOY_SYSTEMD_SERVICE}`..."
+    )
+
+    try:
+        restart_code, restart_output = await _run_deploy_process(
+            ["sudo", "-n", "systemctl", "restart", DEPLOY_SYSTEMD_SERVICE],
+            timeout=30,
+        )
+    except FileNotFoundError as error:
+        await ctx.send(f"Không tìm thấy lệnh cần thiết trên VPS: {error.filename}")
+        return
+    except asyncio.TimeoutError:
+        await ctx.send("Lệnh restart quá thời gian chờ; hãy kiểm tra trạng thái service trên VPS.")
+        return
+    except OSError as error:
+        await ctx.send(f"Không thể restart service: {error}")
+        return
+    if restart_code != 0:
+        await ctx.send(
+            f"Code đã được cập nhật nhưng restart thất bại. "
+            f"Kiểm tra quyền sudo/systemd:\n```text\n{restart_output[-1200:] or 'systemctl restart failed'}\n```"
+        )
 
 
 @bot.event

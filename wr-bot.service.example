@@ -1,0 +1,16 @@
+[Unit]
+Description=SUPERSTAR JYP World Record Discord bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=BOT_USER
+WorkingDirectory=/opt/wr-bot
+EnvironmentFile=/opt/wr-bot/.env
+ExecStart=/opt/wr-bot/.venv/bin/python /opt/wr-bot/wr_bot.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
