@@ -5,7 +5,7 @@ Discord bot theo dõi bảng xếp hạng World Record (WR) của SUPERSTAR JYP.
 ## Tính năng
 
 - Tra cứu leaderboard bằng slash command hoặc prefix command, có phân trang.
-- Hiển thị album cover dạng thumbnail; màu embed được lấy từ cover khi tải ảnh thành công.
+- Hiển thị album cover dạng thumbnail trong embed.
 - Theo dõi điểm top 1 của các bài hát và gửi thông báo khi có WR mới.
 - Tự động so sánh top 100 theo chu kỳ và chỉ gửi thông báo khi điểm của người chơi tăng.
 - Tra cứu những bài mà người chơi trong danh sách theo dõi đang giữ WR.
@@ -34,12 +34,16 @@ Mở `.env`, điền Discord bot token và cấu hình tùy chọn:
 ```dotenv
 DISCORD_TOKEN=your_bot_token
 ALERT_CHANNEL_ID=0
+SLASH_COMMAND_GUILD_ID=967430273883045898
 
 DEPLOY_GIT_BRANCH=main
 DEPLOY_SYSTEMD_SERVICE=wr-bot.service
 ```
 
-`ALERT_CHANNEL_ID` là ID kênh nhận thông báo WR mới; để `0` nếu chưa cấu hình. Các biến `DEPLOY_*` chỉ cần cho chức năng tự deploy lên VPS.
+`ALERT_CHANNEL_ID` là ID kênh nhận thông báo WR mới; để `0` nếu chưa cấu hình.
+`SLASH_COMMAND_GUILD_ID` là ID server Discord nhận slash commands; thay giá trị mặc định
+bằng ID server của bạn nếu khác. Bot đồng bộ slash commands vào server này mỗi lần khởi chạy.
+Các biến `DEPLOY_*` chỉ cần cho chức năng tự deploy lên VPS.
 
 Trong Discord Developer Portal:
 
@@ -47,7 +51,9 @@ Trong Discord Developer Portal:
 2. Mời bot vào server với quyền xem/gửi tin nhắn và nhúng liên kết (**Embed Links**).
 3. Bảo đảm bot có thể truy cập kênh nhận thông báo đã cấu hình.
 
-Slash commands hiện được đăng ký cho server có ID trong `SLASH_COMMAND_GUILD_ID` ở `wr_bot.py`. Nếu dùng server khác, đổi giá trị này trước khi chạy bot.
+Để lấy ID server, bật **Developer Mode** trong Discord, nhấp phải vào server rồi chọn
+**Copy Server ID**. Đặt ID đó trong `SLASH_COMMAND_GUILD_ID` ở file `.env`, sau đó khởi động
+lại bot. Slash commands được đồng bộ riêng cho server này.
 
 Khởi chạy bot:
 

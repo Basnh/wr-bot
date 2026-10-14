@@ -10,6 +10,7 @@ Lệnh Discord:
   !reload                              -> (chỉ chủ bot) đọc lại songs.json và players.txt không cần khởi động lại
   /track (menu: Tất cả | từng người) hoặc !track (menu chọn người) -> người trong players.txt đang giữ WR ở bài nào
   !track <tên>                         -> tra cứu nhanh một người
+  /top1 <nghệ sĩ> (hoặc !top1 <nghệ sĩ>) -> người đứng #1 ở tất cả bài của nghệ sĩ đó
   !track add|remove|list               -> quản lý danh sách theo dõi (add/remove cần quyền Manage Server)
 
 Chạy nền:
@@ -35,15 +36,12 @@ import sys
 import threading
 import time
 import traceback
-from io import BytesIO
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse
 
 import aiohttp
 import discord
 import songs_tool
-from PIL import Image
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -64,7 +62,12 @@ def load_env(filename: str = ".env") -> None:
 load_env()
 
 # ----------------------------- Cấu hình -----------------------------
-TOKEN = os.environ["DISCORD_TOKEN"]
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit(
+        "Thiếu DISCORD_TOKEN. Hãy sao chép .env.example thành .env trong thư mục "
+        "wr_bot rồi điền token bot Discord vào DISCORD_TOKEN."
+    )
 ALERT_CHANNEL_ID = int(os.getenv("ALERT_CHANNEL_ID", "0"))
 DEPLOY_GIT_BRANCH = os.getenv("DEPLOY_GIT_BRANCH", "main").strip()
 DEPLOY_SYSTEMD_SERVICE = os.getenv("DEPLOY_SYSTEMD_SERVICE", "").strip()
@@ -73,7 +76,7 @@ SEASON = 31
 BASE_URL = "https://superstar-jyp.s3.ap-northeast-2.amazonaws.com/world_record_ranking/production"
 GAME_TITLE = "SUPERSTAR JYP"
 PREFIX = "!"            # dùng được cả !world_record và /world_record
-SLASH_COMMAND_GUILD_ID = 967430273883045898
+SLASH_COMMAND_GUILD_ID = int(os.getenv("SLASH_COMMAND_GUILD_ID", "967430273883045898"))
 
 PAGE_SIZE = 10          # số người mỗi trang
 CACHE_TTL = 60          # giây, dùng cho lệnh /world_record
@@ -533,65 +536,6 @@ class WRClient:
 wr = WRClient()
 
 
-ALBUM_COLOR_CACHE: dict[str, int] = {}
-
-
-async def album_cover_color(url: str) -> int | None:
-    """Tải màu chủ đạo của cover để dùng làm màu embed."""
-    if url in ALBUM_COLOR_CACHE:
-        return ALBUM_COLOR_CACHE[url]
-
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        return None
-    if not wr.session:
-        print("[watch] Không thể đọc màu cover: HTTP session chưa khởi tạo.", flush=True)
-        return None
-
-    try:
-        async with wr.sem:
-            async with wr.session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as response:
-                if response.status != 200:
-                    print(f"[watch] Không tải được cover ({response.status}): {url}", flush=True)
-                    return None
-                if not response.headers.get("Content-Type", "").lower().startswith("image/"):
-                    print(f"[watch] URL cover không trả về ảnh: {url}", flush=True)
-                    return None
-                if response.content_length is not None and response.content_length > 8 * 1024 * 1024:
-                    print(f"[watch] Bỏ qua cover lớn hơn 8 MB: {url}", flush=True)
-                    return None
-                image_data = await response.content.read(8 * 1024 * 1024 + 1)
-                if len(image_data) > 8 * 1024 * 1024:
-                    print(f"[watch] Bỏ qua cover lớn hơn 8 MB: {url}", flush=True)
-                    return None
-
-        with Image.open(BytesIO(image_data)) as image:
-            if image.width * image.height > 16 * 1024 * 1024:
-                print(f"[watch] Bỏ qua cover có kích thước ảnh quá lớn: {url}", flush=True)
-                return None
-            image = image.convert("RGB")
-            image.thumbnail((64, 64))
-            colors = image.quantize(colors=16).convert("RGB").getcolors(64 * 64)
-            if not colors:
-                print(f"[watch] Không xác định được màu cover: {url}", flush=True)
-                return None
-            _, (red, green, blue) = max(colors, key=lambda item: item[0])
-            color = (red << 16) | (green << 8) | blue
-            ALBUM_COLOR_CACHE[url] = color
-            return color
-    except (
-        aiohttp.ClientError,
-        asyncio.TimeoutError,
-        OSError,
-        Image.DecompressionBombError,
-    ) as error:
-        print(f"[watch] Lỗi khi đọc màu cover {url}: {error}", flush=True)
-        return None
-
-
 # ----------------------------- Embed -----------------------------
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
 TIME_STYLE = "S"          # kiểu timestamp Discord: t, T, d, D, f, F, R
@@ -616,7 +560,6 @@ def build_embed(
     entry: dict,
     page: int,
     cover_url: str = "",
-    cover_color: int | None = None,
 ) -> discord.Embed:
     data = entry["data"]
     pages = max(1, math.ceil(len(data) / PAGE_SIZE))
@@ -648,7 +591,7 @@ def build_embed(
     embed = discord.Embed(
         title=f"{GAME_TITLE} - World Record (Season {SEASON})",
         description=f"## 🎵 {song_name}\n{wr_line}\n\n" + "\n".join(lines),
-        color=cover_color if cover_color is not None else discord.Color.gold(),
+        color=discord.Color.gold(),
     )
     if cover_url.startswith(("https://", "http://")):
         embed.set_thumbnail(url=cover_url)
@@ -664,14 +607,12 @@ class RankView(discord.ui.View):
         entry: dict,
         owner_id: int,
         cover_url: str = "",
-        cover_color: int | None = None,
     ) -> None:
         super().__init__(timeout=300)
         self.song_name = song_name
         self.entry = entry
         self.owner_id = owner_id
         self.cover_url = cover_url
-        self.cover_color = cover_color
         self.page = 0
         self.pages = max(1, math.ceil(len(entry["data"]) / PAGE_SIZE))
         self.message: discord.Message | None = None
@@ -697,7 +638,6 @@ class RankView(discord.ui.View):
                 self.entry,
                 self.page,
                 self.cover_url,
-                self.cover_color,
             ),
             view=self,
         )
@@ -735,7 +675,12 @@ class WRBot(commands.Bot):
         self.tree.copy_global_to(guild=guild)
         self.tree.clear_commands(guild=None)
         await self.tree.sync()  # Gỡ các slash command global đã đăng ký trước đây.
-        await self.tree.sync(guild=guild)
+        synced_commands = await self.tree.sync(guild=guild)
+        print(
+            f"[slash] Đã đồng bộ {len(synced_commands)} lệnh cho server "
+            f"{SLASH_COMMAND_GUILD_ID}.",
+            flush=True,
+        )
         watch.start()
         if AUTO_RELOAD:
             songs_watcher.start()
@@ -764,23 +709,34 @@ HELP_PAGES = {
             (
                 "🏆 Xem World Record",
                 "`/world_record` — chọn nghệ sĩ, bài hát và album.\n"
-                f"`{PREFIX}wr <ID hoặc từ khóa>` — ví dụ `{PREFIX}wr got7 hard carry`.",
+                f"`{PREFIX}world_record` hoặc `{PREFIX}wr <ID hoặc từ khóa>` — "
+                f"ví dụ `{PREFIX}wr got7 hard carry`.",
+            ),
+            (
+                "🎤 WR #1 theo nghệ sĩ",
+                "`/top1` — chọn nghệ sĩ từ menu, bot liệt kê người đứng #1 ở **tất cả bài** của nghệ sĩ đó "
+                "(sắp xếp theo album, điểm hoặc tên bài).\n"
+                f"`{PREFIX}top1 <nghệ sĩ>` — ví dụ `{PREFIX}top1 itzy`; dùng `--score` hoặc `--name` để đổi cách xếp.",
             ),
             (
                 "🎵 Danh sách bài hát",
-                "`/songs list`, `/songs artists`, `/songs search` — tra cứu bài hát; "
-                "danh sách có embed và nút chuyển trang.\n"
-                f"`{PREFIX}songs` — xem cách dùng các lệnh bài hát.",
+                "`/songs list`, `/songs artists`, `/songs search` — tra cứu; `/songs add`, "
+                "`/songs remove`, `/songs sync` — quản lý (chỉ chủ bot).\n"
+                f"`{PREFIX}songs list|artists|search` — tra cứu; `{PREFIX}songs add|remove|sync` "
+                "— thao tác quản lý (chỉ chủ bot).",
             ),
             (
                 "👤 Theo dõi người chơi",
                 "`/track` — mở menu, chọn **Tất cả** hoặc một người trong `players.txt` để xem họ đang giữ World Record ở bài nào.\n"
-                f"`{PREFIX}track` — mở menu chọn người; `{PREFIX}track <tên>` — tra cứu nhanh.",
+                f"`{PREFIX}track` — mở menu; `{PREFIX}track <tên>` — tra cứu nhanh; "
+                f"`{PREFIX}track list` — xem danh sách.",
             ),
             (
-                "🔒 Quyền quản lý",
-                "Thêm, xóa, đồng bộ bài hát, tải lại dữ liệu và cập nhật WR toàn bộ chỉ dành cho chủ bot.\n"
-                f"`{PREFIX}refresh_wr` — làm mới bảng xếp hạng tất cả ID và lưu snapshot.",
+                "🔒 Lệnh chủ bot",
+                f"`{PREFIX}reload` — tải lại dữ liệu; `{PREFIX}refresh_wr` — cập nhật WR toàn bộ ID "
+                "và lưu snapshot; "
+                f"`{PREFIX}deploy` — cập nhật và khởi động lại bot trên VPS.\n"
+                f"`{PREFIX}help` (bí danh `{PREFIX}h`) hoặc `/help` — mở menu trợ giúp.",
             ),
         ],
     },
@@ -833,6 +789,7 @@ HELP_PAGES = {
                 "Quản lý danh sách (chủ bot hoặc quyền Manage Server)",
                 f"`{PREFIX}track add <nickname hoặc ID>`\n"
                 f"`{PREFIX}track remove <nickname hoặc ID>`\n"
+                "Các lệnh slash `/track add`, `/track remove` hiện không có; dùng lệnh prefix hoặc sửa `players.txt`.\n"
                 "Hoặc mở `players.txt` sửa tay: mỗi dòng một tên, ghi `tên | objectID` để khớp chính xác "
                 "kể cả khi người đó đổi tên. Bot tự đọc lại khi bạn lưu file.",
             ),
@@ -850,7 +807,10 @@ HELP_PAGES = {
             (
                 "Tải lại dữ liệu",
                 f"`{PREFIX}reload` — đọc lại `songs.json` và `players.txt` mà không cần khởi động lại bot.\n"
-                "Bot cũng tự đọc lại file khi phát hiện có thay đổi.",
+                "Bot cũng tự đọc lại file khi phát hiện có thay đổi.\n"
+                f"`{PREFIX}refresh_wr` — cập nhật leaderboard toàn bộ bài; "
+                f"`{PREFIX}deploy` — cập nhật từ Git và restart systemd trên VPS.\n"
+                "Các lệnh này chưa có slash command tương ứng.",
             ),
         ],
     },
@@ -971,9 +931,8 @@ async def build_response(found: list[str], user_id: int):
         return "Chưa có dữ liệu World Record cho bài này.", None, None
 
     cover_url = SONGS[song_id].get("cover", "")
-    cover_color = await album_cover_color(cover_url) if cover_url else None
-    view = RankView(display(song_id), entry, user_id, cover_url, cover_color)
-    return None, build_embed(display(song_id), entry, 0, cover_url, cover_color), view
+    view = RankView(display(song_id), entry, user_id, cover_url)
+    return None, build_embed(display(song_id), entry, 0, cover_url), view
 
 
 # ---------- Autocomplete: chọn nhóm -> chỉ hiện bài của nhóm đó ----------
@@ -1054,6 +1013,204 @@ async def world_record_prefix(ctx: commands.Context, *, query: str = ""):
     text, embed, view = await build_response(find_songs(query), ctx.author.id)
     if text:
         await ctx.send(text)
+        return
+    view.message = await ctx.send(embed=embed, view=view)
+
+
+# ----------------------------- /top1: WR #1 của tất cả bài của một nghệ sĩ -----------------------------
+TOP1_PAGE_SIZE = 8
+TOP1_SORTS = {"album": "Theo album", "score": "Điểm cao → thấp", "name": "Tên bài A → Z"}
+
+
+def resolve_artist(query: str) -> tuple[str | None, str | None]:
+    """Trả về (tên nghệ sĩ chuẩn, thông báo lỗi). Khớp chính xác trước, rồi mới khớp một phần."""
+    q = _norm(query)
+    if not q:
+        return None, "Hãy nhập tên nghệ sĩ."
+    artists = sorted({s["artist"] for s in SONGS.values() if s["artist"]}, key=str.casefold)
+    exact = [a for a in artists if _norm(a) == q]
+    if exact:
+        return exact[0], None
+    partial = [a for a in artists if q in _norm(a)]
+    if len(partial) == 1:
+        return partial[0], None
+    if not partial:
+        return None, f"Không có nghệ sĩ nào khớp `{query}` trong songs.json."
+    return None, "Có nhiều nghệ sĩ khớp, hãy gõ cụ thể hơn:\n" + "\n".join(f"• {a}" for a in partial[:15])
+
+
+async def collect_artist_top1(artist: str) -> tuple[list[dict], list[str]]:
+    """Với mọi bài của nghệ sĩ: người đứng #1 (và điểm). Trả về (các dòng, ID bài chưa có dữ liệu)."""
+    sids = [sid for sid, s in SONGS.items() if _norm(s["artist"]) == _norm(artist)]
+    infos = {sid: SONGS[sid] for sid in sids}
+    entries = await asyncio.gather(*(wr.get(sid, max_age=TRACK_CACHE_TTL) for sid in sids))
+    rows, missing = [], []
+    for sid, entry in zip(sids, entries):
+        if not entry or not entry["data"]:
+            missing.append(sid)
+            continue
+        data = entry["data"]
+        top = max(p["highscore"] for p in data)
+        leaders = sorted((p for p in data if p["highscore"] == top), key=lambda p: p.get("rank", 10**9))
+        first = leaders[0]  # người đứng hạng 1
+        rows.append({
+            "sid": sid,
+            "info": infos[sid],
+            "score": top,
+            "nickname": first.get("nickname") or "(không tên)",
+            "tied": len(leaders),
+            "time": first.get("updatedAt") or 0,
+            "updated": entry["updated"],
+        })
+    return rows, missing
+
+
+def sort_top1_rows(rows: list[dict], mode: str) -> None:
+    album_key = lambda r: _song_album_sort_key((r["sid"], r["info"]))
+    if mode == "score":
+        rows.sort(key=lambda r: (-r["score"], album_key(r)))
+    elif mode == "name":
+        rows.sort(key=lambda r: (_norm(r["info"]["song"]), album_key(r)))
+    else:
+        rows.sort(key=album_key)
+
+
+def build_top1_embed(
+    artist: str, rows: list[dict], missing: list[str], sort_mode: str, page: int
+) -> discord.Embed:
+    esc = discord.utils.escape_markdown
+    pages = max(1, math.ceil(len(rows) / TOP1_PAGE_SIZE))
+    chunk = rows[page * TOP1_PAGE_SIZE : (page + 1) * TOP1_PAGE_SIZE]
+
+    # --- tóm tắt ---
+    summary = f"🎤 **{esc(artist)}** · **{len(rows)}** bài có dữ liệu"
+    if missing:
+        summary += f" (+{len(missing)} bài chưa có dữ liệu)"
+    counts: dict[str, list] = {}
+    for r in rows:
+        counts.setdefault(_norm(r["nickname"]), [r["nickname"], 0])[1] += 1
+    leaders = sorted((v for v in counts.values() if v[1] >= 2), key=lambda v: -v[1])[:3]
+    if leaders:
+        summary += "\n👑 Giữ nhiều #1 nhất: " + ", ".join(f"**{esc(n)}** ({c} bài)" for n, c in leaders)
+
+    # --- danh sách ---
+    lines: list[str] = []
+    last_album = None
+    for r in chunk:
+        album = r["info"]["album"].strip()
+        if sort_mode == "album" and (not lines or album != last_album):
+            lines.append(f"**💿 {esc(album) if album else 'Không rõ album'}**")
+        last_album = album
+        title = r["info"]["song"] or f"Bài {r['sid']}"
+        lines.append(f"• **{esc(title)}** · `{r['score']:,}`")
+        sub = f"🥇 {esc(r['nickname'])}"
+        if r["time"]:
+            sub += f" · {ts_tag(r['time'])}"
+        if r["tied"] > 1:
+            sub += f" · +{r['tied'] - 1} đồng điểm"
+        lines.append(f"-# {sub}")
+
+    embed = discord.Embed(
+        title=f"{GAME_TITLE} - WR #1 của {artist} (Season {SEASON})",
+        description=f"{summary}\n\n" + "\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(text=f"Trang {page + 1}/{pages} · Sắp xếp: {TOP1_SORTS.get(sort_mode, sort_mode)}")
+    embed.timestamp = max(r["updated"] for r in rows)
+    return embed
+
+
+class Top1View(discord.ui.View):
+    def __init__(self, owner_id: int, artist: str, rows: list[dict], missing: list[str], sort_mode: str) -> None:
+        super().__init__(timeout=300)
+        self.owner_id, self.artist, self.rows = owner_id, artist, rows
+        self.missing, self.sort_mode = missing, sort_mode
+        self.page = 0
+        self.pages = max(1, math.ceil(len(rows) / TOP1_PAGE_SIZE))
+        self.message: discord.Message | None = None
+        self._sync()
+
+    def render(self) -> discord.Embed:
+        return build_top1_embed(self.artist, self.rows, self.missing, self.sort_mode, self.page)
+
+    def _sync(self) -> None:
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.pages - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("Chỉ người dùng lệnh mới bấm được nút này.", ephemeral=True)
+        return False
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        self._sync()
+        await interaction.response.edit_message(embed=self.render(), view=self)
+
+    @discord.ui.button(label="Trang trước", style=discord.ButtonStyle.primary)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page -= 1
+        await self._show(interaction)
+
+    @discord.ui.button(label="Trang sau", style=discord.ButtonStyle.success)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page += 1
+        await self._show(interaction)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+async def build_top1_response(artist_query: str, sort_mode: str, user_id: int):
+    """Trả về (text, embed, view). Nếu text khác None thì đó là thông báo lỗi/gợi ý."""
+    artist, err = resolve_artist(artist_query)
+    if err:
+        return err, None, None
+    rows, missing = await collect_artist_top1(artist)
+    if not rows:
+        return f"Chưa có dữ liệu World Record cho các bài của **{artist}**.", None, None
+    sort_mode = sort_mode if sort_mode in TOP1_SORTS else "album"
+    sort_top1_rows(rows, sort_mode)
+    view = Top1View(user_id, artist, rows, missing, sort_mode)
+    return None, view.render(), view
+
+
+@bot.tree.command(name="top1", description="Xem WR #1 của tất cả bài hát của một nghệ sĩ")
+@app_commands.describe(artist="Nhóm / nghệ sĩ (chọn từ menu)", sort="Cách sắp xếp (mặc định: theo album)")
+@app_commands.choices(sort=[app_commands.Choice(name=v, value=k) for k, v in TOP1_SORTS.items()])
+@app_commands.autocomplete(artist=artist_autocomplete)
+async def top1_slash(interaction: discord.Interaction, artist: str, sort: str = "album"):
+    await interaction.response.defer()
+    text, embed, view = await build_top1_response(artist, sort, interaction.user.id)
+    if text:
+        await interaction.followup.send(text, allowed_mentions=discord.AllowedMentions.none())
+        return
+    view.message = await interaction.followup.send(embed=embed, view=view, wait=True)
+
+
+# Prefix: !top1 <nghệ sĩ> [--score | --name | --album]   ví dụ: !top1 itzy  |  !top1 got7 --score
+@bot.command(name="top1", aliases=["artist_wr"])
+async def top1_prefix(ctx: commands.Context, *, query: str = ""):
+    sort_mode, words = "album", []
+    for token in query.split():
+        if token.lower() in ("--score", "--name", "--album"):
+            sort_mode = token.lower()[2:]
+        else:
+            words.append(token)
+    artist_query = " ".join(words)
+    if not artist_query:
+        await ctx.send(f"Cách dùng: `{PREFIX}top1 <nghệ sĩ> [--score | --name]`, ví dụ `{PREFIX}top1 itzy`")
+        return
+    async with ctx.typing():
+        text, embed, view = await build_top1_response(artist_query, sort_mode, ctx.author.id)
+    if text:
+        await ctx.send(text, allowed_mentions=discord.AllowedMentions.none())
         return
     view.message = await ctx.send(embed=embed, view=view)
 
@@ -2664,11 +2821,10 @@ async def _watch_cycle() -> None:
             return
         if top_score > prev["score"]:
             cover_url = SONGS[song_id].get("cover", "")
-            color = await album_cover_color(cover_url) if cover_url else None
             embed = discord.Embed(
                 title="🏆 World Record mới!",
                 description=f"**{display(song_id)}**",
-                color=color if color is not None else discord.Color.gold(),
+                color=discord.Color.gold(),
             )
             if cover_url.startswith(("https://", "http://")):
                 embed.set_thumbnail(url=cover_url)
