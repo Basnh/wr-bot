@@ -22,7 +22,8 @@ import urllib.request
 SHEET_ID = "1nDmSiHxvK49KogoFQa8JAWgiv8gEppepXRdeaUvoQVg"
 GID = "846847389"
 EXPORT_URL = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
-OUTPUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "songs.json")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+OUTPUT = os.path.join(DATA_DIR, "songs.json")
 
 # Tên cột trong sheet (không phân biệt hoa thường)
 COL_ID, COL_ARTIST, COL_SONG = "id", "artist", "song"

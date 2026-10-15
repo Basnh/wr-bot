@@ -10,6 +10,7 @@ Discord bot theo dõi bảng xếp hạng World Record (WR) của SUPERSTAR JYP.
 - Tự động so sánh top 100 theo chu kỳ và chỉ gửi thông báo khi điểm của người chơi tăng.
 - Tra cứu những bài mà người chơi trong danh sách theo dõi đang giữ WR.
 - Quản lý và đồng bộ danh sách bài hát từ Google Sheets hoặc CSV.
+- Quản lý lịch sinh nhật và kỷ niệm bonus theo baseline; bot giữ mức bonus và khoảng ngày `From–To` của từng dòng, đồng thời hỗ trợ thêm sự kiện mới.
 - Tùy chọn tự cập nhật mã nguồn trên VPS qua `!deploy` và systemd.
 
 ## Yêu cầu
@@ -34,13 +35,15 @@ Mở `.env`, điền Discord bot token và cấu hình tùy chọn:
 ```dotenv
 DISCORD_TOKEN=your_bot_token
 ALERT_CHANNEL_ID=0
+WR_ALERT_CHANNEL_ID=0
 SLASH_COMMAND_GUILD_ID=967430273883045898
 
 DEPLOY_GIT_BRANCH=main
 DEPLOY_SYSTEMD_SERVICE=wr-bot.service
 ```
 
-`ALERT_CHANNEL_ID` là ID kênh nhận thông báo WR mới; để `0` nếu chưa cấu hình.
+`ALERT_CHANNEL_ID` là ID kênh nhận từng embed thay đổi Top 100; `WR_ALERT_CHANNEL_ID`
+là ID kênh riêng nhận embed vàng “World Record mới!”. Để `0` nếu chưa cấu hình.
 `SLASH_COMMAND_GUILD_ID` là ID server Discord nhận slash commands; thay giá trị mặc định
 bằng ID server của bạn nếu khác. Bot đồng bộ slash commands vào server này mỗi lần khởi chạy.
 Các biến `DEPLOY_*` chỉ cần cho chức năng tự deploy lên VPS.
@@ -49,7 +52,7 @@ Trong Discord Developer Portal:
 
 1. Bật **Message Content Intent** ở phần Bot để sử dụng lệnh prefix như `!wr`.
 2. Mời bot vào server với quyền xem/gửi tin nhắn và nhúng liên kết (**Embed Links**).
-3. Bảo đảm bot có thể truy cập kênh nhận thông báo đã cấu hình.
+3. Bảo đảm bot có thể truy cập cả hai kênh nhận thông báo đã cấu hình.
 
 Để lấy ID server, bật **Developer Mode** trong Discord, nhấp phải vào server rồi chọn
 **Copy Server ID**. Đặt ID đó trong `SLASH_COMMAND_GUILD_ID` ở file `.env`, sau đó khởi động
@@ -115,9 +118,13 @@ Các lệnh thay đổi dữ liệu chỉ dành cho chủ bot. `!songs sync` đ�
 | --- | --- |
 | `!reload` | Đọc lại `songs.json` và `players.txt` ngay lập tức. |
 | `!refresh_wr` | Làm mới leaderboard cho tất cả ID và ghi snapshot để so sánh với lần sau. Alias: `!update_wr`, `!wr_update`. |
+| `!bonus add <loại> <MM-DD> <0|2|3|4|5|6|7|9> <tên>` | Thêm sự kiện bonus hằng năm (`birthday`, `song` hoặc `album`); có thể dùng `/bonus add` tương đương. |
+| `!bonus list` | Mở menu chọn tháng, nhóm các mục dưới tên artist và phân trang; mặc định vào tháng/trang gần ngày gọi lệnh nhất. |
+| `!bonus now` | Xem sự kiện đang hiệu lực trong embed nhóm theo artist. Bot cũng tự thông báo mỗi ngày trong thời gian bonus có hiệu lực. |
+| `!bonus remove <ID>` | Xóa sự kiện theo ID. |
 | `!deploy` | Trên VPS đã cấu hình, lấy code mới từ Git và khởi động lại systemd service. |
 
-Watcher kiểm tra top 1 và top 100 khoảng 3 phút một lần. Khi điểm của người đã có trong top 100 tăng, bot gửi embed vào `ALERT_CHANNEL_ID`, kèm điểm cũ/mới và hạng hiện tại. Bot không gửi thông báo chỉ vì đổi thứ hạng, tụt hạng, rời top 100 hoặc lần đầu xuất hiện trong top 100. Dù vậy, các thay đổi này vẫn được cập nhật trong snapshot để lần so sánh sau dùng dữ liệu mới nhất. Lần đầu với ID chưa có snapshot chỉ tạo baseline, không gửi thông báo hàng loạt. ID không tải được dữ liệu mới sẽ giữ snapshot cũ.
+Watcher kiểm tra top 1 và top 100 khoảng 3 phút một lần. Khi điểm của người đã có trong top 100 tăng, bot gửi mỗi embed thành một tin nhắn riêng vào `ALERT_CHANNEL_ID`, kèm điểm cũ/mới và hạng hiện tại. Embed vàng “World Record mới!” được gửi riêng vào `WR_ALERT_CHANNEL_ID`. Bot không gửi thông báo Top 100 chỉ vì đổi thứ hạng, tụt hạng, rời top 100 hoặc lần đầu xuất hiện trong top 100. Dù vậy, các thay đổi này vẫn được cập nhật trong snapshot để lần so sánh sau dùng dữ liệu mới nhất. Lần đầu với ID chưa có snapshot chỉ tạo baseline, không gửi thông báo hàng loạt. ID không tải được dữ liệu mới sẽ giữ snapshot cũ.
 
 `!refresh_wr` vẫn có thể dùng để làm mới ngay toàn bộ danh sách bài. Lệnh này tạo baseline nếu chưa có snapshot; nếu phát hiện điểm tăng trong top 100 thì gửi embed vào kênh cảnh báo đã cấu hình và báo tổng kết tại kênh gọi lệnh. Trạng thái snapshot được lưu ở `wr_rankings.json`, không đồng bộ qua Git.
 
@@ -125,10 +132,14 @@ Bot kiểm tra điểm WR nền định kỳ khoảng 3 phút. Ở lần chạy 
 
 ## Dữ liệu
 
-- `songs.json`: danh sách bài hát theo ID, gồm nghệ sĩ, tên bài, album và URL cover. Cover được hiển thị cạnh nội dung embed dưới dạng thumbnail.
-- `players.txt`: tên người chơi cần theo dõi, mỗi tên một dòng.
-- `wr_state.json`: điểm top 1 gần nhất dùng cho watcher thông báo WR mới.
-- `wr_rankings.json`: snapshot leaderboard được watcher và `!refresh_wr` dùng để so sánh rank/điểm. Đây là dữ liệu runtime và được loại khỏi Git.
+Các file dữ liệu nằm trong thư mục `data/`:
+
+- `data/songs.json`: danh sách bài hát theo ID, gồm nghệ sĩ, tên bài, album và URL cover. Cover được hiển thị cạnh nội dung embed dưới dạng thumbnail.
+- `data/players.txt`: tên người chơi cần theo dõi, mỗi tên một dòng.
+- `data/wr_state.json`: điểm top 1 gần nhất dùng cho watcher thông báo WR mới.
+- `data/wr_rankings.json`: snapshot leaderboard được watcher và `!refresh_wr` dùng để so sánh rank/điểm. Đây là dữ liệu runtime và được loại khỏi Git.
+- `data/bonus_events.json`: lịch bonus gồm 481 dòng baseline, giữ mức bonus cùng khoảng `From–To` và lặp lại hằng năm.
+- `data/bonus_baseline.tsv`: bản TSV gốc được tạo từ dữ liệu cậu dán để tiện đối chiếu/cập nhật.
 
 Ví dụ một bản ghi trong `songs.json`:
 

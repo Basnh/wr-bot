@@ -27,7 +27,8 @@ import shutil
 import sys
 import urllib.request
 
-SONGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "songs.json")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+SONGS_FILE = os.path.join(DATA_DIR, "songs.json")
 
 SHEET_ID = "1nDmSiHxvK49KogoFQa8JAWgiv8gEppepXRdeaUvoQVg"
 GID = "846847389"

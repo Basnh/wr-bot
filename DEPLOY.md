@@ -7,7 +7,7 @@ service. It refuses to deploy when the VPS checkout has uncommitted changes.
 
 The owner can also run `!refresh_wr` to fetch every song ID's current leaderboard,
 compare it with the previous snapshot, and save the latest rows and rank/score
-changes to `wr_rankings.json`. The snapshot is runtime data and is excluded from Git.
+changes to `data/wr_rankings.json`. The snapshot is runtime data and is excluded from Git.
 
 ## One-time setup
 
